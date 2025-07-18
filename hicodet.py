@@ -10,7 +10,7 @@ Australian Centre for Robotic Vision
 import os
 import json
 import numpy as np
-
+import torch
 from typing import Optional, List, Callable, Tuple
 from pocket.data import ImageDataset, DataSubset
 
@@ -64,7 +64,9 @@ class HICODet(ImageDataset):
     def __init__(self, root: str, anno_file: str,
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
-            transforms: Optional[Callable] = None) -> None:
+            transforms: Optional[Callable] = None,
+            llava_answer_path:Optional[str] = None,
+            llava_token_path:Optional[str] = None) -> None:
         super(HICODet, self).__init__(root, transform, target_transform, transforms)
         with open(anno_file, 'r') as f:
             anno = json.load(f)
@@ -76,7 +78,13 @@ class HICODet(ImageDataset):
 
         # Load annotations
         self._load_annotation_and_metadata(anno)
-
+        if "train" in self._root:
+            self.llava_answer_path = llava_answer_path.rstrip('/') + "/train/"
+            self.llava_token_path = llava_token_path.rstrip('/') + "/train/"
+        if "test" in self._root:
+            self.llava_answer_path = llava_answer_path.rstrip('/') + "/test/"
+            self.llava_token_path = llava_token_path.rstrip('/') + "/test/"
+        
     def __len__(self) -> int:
         """Return the number of images"""
         return len(self._idx)
@@ -96,10 +104,18 @@ class HICODet(ImageDataset):
                     "object": list[N]
         """
         intra_idx = self._idx[i]
+        with open(f"{self.llava_answer_path+self._filenames[intra_idx].replace('jpg', 'txt')}", "r") as f:
+            llava_answer = f.readlines()
+        try:
+            llava_answer_label = np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
+        except:
+            llava_answer_label = np.array([57], dtype=np.int64)
+        llava_vision_feature = torch.load(f"{self.llava_token_path+self._filenames[intra_idx].replace('jpg', 'pt')}", "cpu").to(torch.float32)
+
         return self._transforms(
             self.load_image(os.path.join(self._root, self._filenames[intra_idx])), 
             self._anno[intra_idx]
-            )
+            ), llava_answer_label, llava_vision_feature
 
     def __repr__(self) -> str:
         """Return the executable string representation"""
