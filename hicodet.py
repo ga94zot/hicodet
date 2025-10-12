@@ -66,7 +66,8 @@ class HICODet(ImageDataset):
             target_transform: Optional[Callable] = None,
             transforms: Optional[Callable] = None,
             llava_answer_path:Optional[str] = None,
-            llava_token_path:Optional[str] = None) -> None:
+            llava_token_path:Optional[str] = None,
+            train_type:Optional[str] = 'default') -> None:
         super(HICODet, self).__init__(root, transform, target_transform, transforms)
         with open(anno_file, 'r') as f:
             anno = json.load(f)
@@ -75,20 +76,37 @@ class HICODet(ImageDataset):
         self.num_interation_cls = 600
         self.num_action_cls = 117
         self._anno_file = anno_file
-
+        
         # Load annotations
-        self._load_annotation_and_metadata(anno)
+        self._load_annotation_and_metadata(anno, train_type)
         if "train" in self._root:
             self.llava_answer_path = llava_answer_path.rstrip('/') + "/train/"
             self.llava_token_path = llava_token_path.rstrip('/') + "/train/"
         if "test" in self._root:
             self.llava_answer_path = llava_answer_path.rstrip('/') + "/test/"
             self.llava_token_path = llava_token_path.rstrip('/') + "/test/"
-        
+        self.train_type = train_type
+        if self.train_type == 'default':
+            self.train_idx = self._idx
+        if self.train_type == 'RF_UC':
+            self.train_idx = self._rf_uc_idx if "train" in self._root else self._idx
+            self.seen = self._rf_seen
+            self.unseen = self.rf_uc
+        if self.train_type == 'NF_UC':
+            self.train_idx = self._nf_uc_idx if "train" in self._root else self._idx
+            self.seen = self._nf_seen
+            self.unseen = self.nf_uc
+        if self.train_type == 'UV':
+            self.train_idx = self._uv_idx if "train" in self._root else self._idx
+            self.seen = self._seen_v
+            self.unseen = self.uv
+        if self.train_type == "UO":
+            self.train_idx = self._uo_idx if "train" in self._root else self._idx
+            self.seen = self._seen_o
+            self.unseen = self.uo
     def __len__(self) -> int:
         """Return the number of images"""
-        return len(self._idx)
-
+        return len(self.train_idx)
     def __getitem__(self, i: int) -> tuple:
         """
         Arguments:
@@ -103,7 +121,7 @@ class HICODet(ImageDataset):
                     "verb": list[N]
                     "object": list[N]
         """
-        intra_idx = self._idx[i]
+        intra_idx = self.train_idx[i]
         with open(f"{self.llava_answer_path+self._filenames[intra_idx].replace('jpg', 'txt')}", "r") as f:
             llava_answer = f.readlines()
         try:
@@ -280,6 +298,43 @@ class HICODet(ImageDataset):
             list[int]
         """
         return self._non_rare
+    
+    @property
+    def rf_uc(self) -> List[int]:
+        """
+        List of rare-first unseen combination class indices
+
+        Returns:
+        """
+        return self._rf_uc
+    
+    @property
+    def nf_uc(self) -> List[int]:
+        """
+        List of non-rare-first unseen combination class indices
+
+        Returns:
+        """
+        return self._nf_uc
+    
+    @property
+    def uv(self) -> List[int]:
+        """
+        List of unseen verb class indices
+
+        Returns:
+        """
+        return self._uv
+    
+    @property
+    def uo(self) -> List[int]:
+        """
+        List of unseen object class indices
+
+        Returns:
+        """
+        return self._uo
+    
 
     def split(self, ratio: float) -> Tuple[HICODetSubset, HICODetSubset]:
         """
@@ -303,7 +358,7 @@ class HICODet(ImageDataset):
         """Return the size (width, height) of an image"""
         return self._image_sizes[self._idx[idx]]
 
-    def _load_annotation_and_metadata(self, f: dict) -> None:
+    def _load_annotation_and_metadata(self, f: dict, train_type) -> None:
         """
         Arguments:
             f(dict): Dictionary loaded from {anno_file}.json
@@ -329,3 +384,107 @@ class HICODet(ImageDataset):
         self._verbs = f['verbs']
         self._rare = f['rare']
         self._non_rare = f['non_rare']
+        hico_unseen_index = {
+            "default": [],
+            # start from 0
+            "rare_first": [509, 279, 280, 402, 504, 286, 499, 498, 289, 485, 303, 311, 325, 439, 351, 358, 66, 427, 379, 418,
+                        70, 416,
+                        389, 90, 395, 76, 397, 84, 135, 262, 401, 592, 560, 586, 548, 593, 526, 181, 257, 539, 535, 260, 596,
+                        345, 189,
+                        205, 206, 429, 179, 350, 405, 522, 449, 261, 255, 546, 547, 44, 22, 334, 599, 239, 315, 317, 229,
+                        158, 195,
+                        238, 364, 222, 281, 149, 399, 83, 127, 254, 398, 403, 555, 552, 520, 531, 440, 436, 482, 274, 8, 188,
+                        216, 597,
+                        77, 407, 556, 469, 474, 107, 390, 410, 27, 381, 463, 99, 184, 100, 292, 517, 80, 333, 62, 354, 104,
+                        55, 50,
+                        198, 168, 391, 192, 595, 136, 581],  # 120
+            "non_rare_first": [38, 41, 20, 18, 245, 11, 19, 154, 459, 42, 155, 139, 60, 461, 577, 153, 582, 89, 141, 576, 75,
+                            212, 472, 61,
+                            457, 146, 208, 94, 471, 131, 248, 544, 515, 566, 370, 481, 226, 250, 470, 323, 169, 480, 479,
+                            230, 385, 73,
+                            159, 190, 377, 176, 249, 371, 284, 48, 583, 53, 162, 140, 185, 106, 294, 56, 320, 152, 374, 338,
+                            29, 594, 346,
+                            456, 589, 45, 23, 67, 478, 223, 493, 228, 240, 215, 91, 115, 337, 559, 7, 218, 518, 297, 191,
+                            266, 304, 6, 572,
+                            529, 312, 9, 308, 417, 197, 193, 163, 455, 25, 54, 575, 446, 387, 483, 534, 340, 508, 110, 329,
+                            246, 173, 506,
+                            383, 93, 516, 64],  # 120
+            "unseen_object": [111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+                            126, 127, 128, 224, 225, 226, 227, 228, 229, 230, 231, 290, 291, 292, 293,
+                            294, 313, 314, 315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 336, 337,
+                            338, 339, 340, 341, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428,
+                            429, 430, 431, 432, 433, 453, 454, 455, 456, 457, 458, 459, 460, 461, 462,
+                            463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 533, 534, 535, 536,
+                            537, 558, 559, 560, 561, 595, 596, 597, 598, 599],  # 100
+            "unseen_verb": [4, 6, 12, 15, 18, 25, 34, 38, 40, 49, 58, 60, 68, 69, 72, 73, 77, 82, 96, 97, 104, 113, 116, 118,
+                            122, 129, 139, 147,
+                            150, 153, 165, 166, 172, 175, 176, 181, 190, 202, 210, 212, 219, 227, 228, 233, 235, 243, 298, 313,
+                            315, 320, 326, 336,
+                            342, 345, 354, 372, 401, 404, 409, 431, 436, 459, 466, 470, 472, 479, 481, 488, 491, 494, 498, 504,
+                            519, 523, 535, 536,
+                            541, 544, 562, 565, 569, 572, 591, 595]
+            # 84, 20 unseen verbs: [41, 100, 99, 91, 34, 42, 97, 84, 26, 106, 38, 56, 92, 79, 19, 76, 80, 2, 114, 62]
+        }
+        self._rf_uc = hico_unseen_index['rare_first']
+        self._rf_seen = list(range(600))
+        for _ii_ in self._rf_uc:
+            self._rf_seen.remove(_ii_)
+        
+        self._nf_uc = hico_unseen_index['non_rare_first']
+        self._nf_seen = list(range(600))
+        for _ii_ in self._nf_uc:
+            self._nf_seen.remove(_ii_)
+        
+        self._uv = hico_unseen_index['unseen_verb']
+        self._seen_v = list(range(600))
+        for _ii_ in self._uv:
+            self._seen_v.remove(_ii_)
+
+        self._uo = hico_unseen_index['unseen_object']
+        self._seen_o = list(range(600))
+        for _ii_ in self._uo:
+            self._seen_o.remove(_ii_)
+
+        if train_type == "RF_UC":
+            self._rf_uc_idx = self._idx.copy()
+            if "train" in self._root:
+                for i in idx:
+                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                        if hoi in self._rf_uc:
+                            for k in self._anno[i].keys():
+                                self._anno[i][k].pop(pair_idx)
+                        if len(self._anno[i]['hoi']) == 0:
+                            self._rf_uc_idx.remove(i)
+        
+        if train_type == "NF_UC":
+            self._nf_uc_idx = self._idx.copy()
+            if "train" in self._root:
+                for i in idx:
+                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                        if hoi in self._nf_uc:
+                            for k in self._anno[i].keys():
+                                self._anno[i][k].pop(pair_idx)
+                        if len(self._anno[i]['hoi']) == 0:
+                            self._nf_uc_idx.remove(i)
+        
+        if train_type == "UV":
+            self._uv_idx = self._idx.copy()
+            if "train" in self._root:
+                for i in idx:
+                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                        if hoi in self._uv:
+                            for k in self._anno[i].keys():
+                                self._anno[i][k].pop(pair_idx)
+                        if len(self._anno[i]['hoi']) == 0:
+                            self._uv_idx.remove(i)
+        
+        if train_type == "UO":
+            self._uo_idx = self._idx.copy()
+            if "train" in self._root:
+                for i in idx:
+                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                        if hoi in self._uo:
+                            for k in self._anno[i].keys():
+                                self._anno[i][k].pop(pair_idx)
+                        if len(self._anno[i]['hoi']) == 0:
+                            self._uo_idx.remove(i)
