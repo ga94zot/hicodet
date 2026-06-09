@@ -24,10 +24,18 @@ from models import build_model
 import datasets.transforms as T
 
 class Engine(pocket.core.DistributedLearningEngine):
-    def __init__(self, net, criterion, dataloader, max_norm, **kwargs):
+    def __init__(self, net, criterion, dataloader, max_norm, postprocessor, test_loader, **kwargs):
         super().__init__(net, criterion, dataloader, **kwargs)
         self.max_norm = max_norm
-
+        self.postprocessor = postprocessor
+        self.test_loader = test_loader
+        self.temp = [
+             4, 47, 24, 46, 34, 35, 21, 59, 13,  1, 14,  8, 73, 39, 45, 50,  5,
+            55,  2, 51, 15, 67, 56, 74, 57, 19, 41, 60, 16, 54, 20, 10, 42, 29,
+            23, 78, 26, 17, 52, 66, 33, 43, 63, 68,  3, 64, 49, 69, 12,  0, 53,
+            58, 72, 65, 48, 76, 18, 71, 36, 30, 31, 44, 32, 11, 28, 37, 77, 38,
+            27, 70, 61, 79,  9,  6,  7, 62, 25, 75, 40, 22
+        ]
     def _on_start_epoch(self):
         self._state.epoch += 1
         self._state.net.train()
@@ -43,7 +51,15 @@ class Engine(pocket.core.DistributedLearningEngine):
         if self.max_norm > 0:
             torch.nn.utils.clip_grad_norm_(self._state.net.parameters(), self.max_norm)
         self._state.optimizer.step()
-
+    def _on_end_epoch(self):
+        # Save checkpoint in the master process
+        mAP, max_recall = self.eval(self.postprocessor)
+        if self._rank == 0:
+            self.save_checkpoint()
+        if self._state.lr_scheduler is not None:
+            self._state.lr_scheduler.step()
+        with open("/home/MasterThesis/pvic/hicodet/detections/log.txt" ,'a') as f:
+            f.write(f"epoch={self._state.epoch}, mAP={mAP}, max_recall={max_recall}\n")
     @torch.no_grad()
     def eval(self, postprocessors, thresh=0.1):
         self._state.net.eval()
@@ -52,11 +68,12 @@ class Engine(pocket.core.DistributedLearningEngine):
             80, algorithm='INT', nproc=10
         )
         num_gt = torch.zeros(80)
-        if self._train_loader.batch_size != 1:
-            raise ValueError(f"The batch size shoud be 1, not {self._train_loader.batch_size}")
-        for image, target in tqdm(self._train_loader):
+        if self.test_loader.batch_size != 1:
+            raise ValueError(f"The batch size shoud be 1, not {self.test_loader.batch_size}")
+        for image, target, llava_vision_token in tqdm(self.test_loader):
             image = pocket.ops.relocate_to_cuda(image)
-            output = self._state.net(image)
+            llava_vision_token = pocket.ops.relocate_to_cuda(llava_vision_token)
+            output = self._state.net(image, llava_vision_token)
             output = pocket.ops.relocate_to_cpu(output)
             scores, labels, boxes = postprocessors(
                 output, target[0]['size'].unsqueeze(0)
@@ -82,7 +99,8 @@ class Engine(pocket.core.DistributedLearningEngine):
             unique_cls = labels.unique()
             for c in unique_cls:
                 det_idx = torch.nonzero(labels == c).squeeze(1)
-                gt_idx = torch.nonzero(gt_labels == c).squeeze(1)
+                c_converted = self.temp[c] if c != 0 else 0
+                gt_idx = torch.nonzero(gt_labels == c_converted).squeeze(1)
                 if len(gt_idx) == 0:
                     continue
                 binary_labels[det_idx] = associate(
@@ -111,7 +129,9 @@ class HICODetObject(Dataset):
     def __len__(self):
         return len(self.dataset)
     def __getitem__(self, idx):
-        image, target = self.dataset[idx]
+        detr_meta, llava_vision_token = self.dataset[idx]
+        image = detr_meta[0]
+        target = detr_meta[1]
         boxes = torch.cat([
             target['boxes_h'],
             target['boxes_o']
@@ -134,7 +154,7 @@ class HICODetObject(Dataset):
         converted_labels = torch.as_tensor([self.conversion[i.item()] for i in labels])
         # Apply transform
         image, target = self.transforms(image, dict(boxes=boxes, labels=converted_labels))
-        return image, target
+        return image, target, llava_vision_token
 
 def initialise(args):
     # Load model and loss function
@@ -142,7 +162,8 @@ def initialise(args):
     class_embed = torch.nn.Linear(256, 81, bias=True)
     if os.path.exists(args.pretrained):
         print(f"Load pre-trained model from {args.pretrained}")
-        detr.load_state_dict(torch.load(args.pretrained)['model_state_dict'])
+        # detr.load_state_dict(torch.load(args.pretrained)['model'], strict=False)
+        detr.load_state_dict(torch.load(args.pretrained)['model_state_dict'], strict=False)
         w, b = detr.class_embed.state_dict().values()
         keep = [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
@@ -192,15 +213,23 @@ def initialise(args):
             target_transform=pocket.ops.ToTensor(input_format='dict')
         ), transforms
     )
-
-    return detr, criterion, postprocessors['bbox'], dataset
+    test_dataset = HICODetObject(
+        pocket.data.HICODet(
+            root=os.path.join(args.data_root, f'hico_20160224_det/images/test2015'),
+            anno_file=os.path.join(args.data_root, f'instances_test2015.json'),
+            target_transform=pocket.ops.ToTensor(input_format='dict')
+        ), transforms
+    )
+    return detr, criterion, postprocessors['bbox'], dataset, test_dataset
 
 def collate_fn(batch):
     images = []; targets = []
-    for img, tgt in batch:
+    llava_vision_tokens = []
+    for img, tgt, llava_vision_token in batch:
         images.append(img)
         targets.append(tgt)
-    return images, targets
+        llava_vision_tokens.append(llava_vision_token)
+    return images, targets, llava_vision_tokens
 
 def main(rank, args):
 
@@ -219,7 +248,7 @@ def main(rank, args):
 
     torch.cuda.set_device(rank)
 
-    model, criterion, postprocessors, dataset = initialise(args)
+    model, criterion, postprocessors, dataset, test_dataset = initialise(args)
     if args.eval:
         sampler = torch.utils.data.SequentialSampler(dataset)
         dataloader = DataLoader(
@@ -238,10 +267,16 @@ def main(rank, args):
             dataset, batch_sampler=batch_sampler,
             collate_fn=collate_fn, num_workers=args.num_workers
         )
-
+    test_sampler = torch.utils.data.SequentialSampler(test_dataset)
+    test_dataloader =DataLoader(
+        dataset, sampler=test_sampler,
+        batch_size=1, collate_fn=collate_fn,
+        num_workers=args.num_workers,
+        drop_last=False
+    )
     engine = Engine(
         model, criterion, dataloader,
-        max_norm=args.clip_max_norm,
+        max_norm=args.clip_max_norm, postprocessor=postprocessors, test_loader=test_dataloader,
         print_interval=args.print_interval,
         cache_dir=args.output_dir
     )
@@ -260,6 +295,21 @@ def main(rank, args):
                 "lr": args.lr_backbone,
             },
         ]
+        # param_dicts = [
+        #     {
+        #         "params": [p for n, p in model.named_parameters()
+        #         if ("backbone" not in n) and ("decoder" not in n)  and ("embed" not in n) and p.requires_grad]
+        #     }, {
+        #         "params": [p for n, p in model.named_parameters()
+        #         if "backbone" in n and p.requires_grad],
+        #         "lr": args.lr_backbone,
+        #     },
+        #     {
+        #         "params": [p for n, p in model.named_parameters()
+        #         if ("decoder" in n) or ("embed" in n) and p.requires_grad],
+        #         "lr": args.lr * 10,
+        #     },
+        # ]
         optimizer = torch.optim.AdamW(
             param_dicts, lr=args.lr,
             weight_decay=args.weight_decay
@@ -271,12 +321,12 @@ def main(rank, args):
 
 @torch.no_grad()
 def sanity_check(args):
-    model, criterion, postprocessors, dataset = initialise(args)
-    image, target = dataset[0]
+    model, criterion, postprocessors, dataset, test_dataset = initialise(args)
+    image, target, llava_vision_token = dataset[1]
     print("\nPrinting out the detection target =>")
     for k, v in target.items():
         print(f"{k}: {v}")
-    output = model([image])
+    output = model([image], [llava_vision_token])
     loss_dict = criterion(output, [target])
     print("\nPrinting out the computed losses =>")
     for k, v in loss_dict.items():
@@ -298,7 +348,7 @@ def sanity_check(args):
     image_copy = image.copy()
     pocket.utils.draw_boxes(image, boxes[keep], width=3)
     image.show(title='Detected boxes')
-
+    image.save("/home/MasterThesis/pvic/hicodet/detections/test_image_det.png")
     _, _, boxes = postprocessors(
         dict(
             pred_logits=torch.rand(1, 3, 81),
@@ -307,13 +357,14 @@ def sanity_check(args):
     )[0].values()
     pocket.utils.draw_boxes(image_copy, boxes, width=3)
     image_copy.show(title='Ground truth boxes')
+    image_copy.save("/home/MasterThesis/pvic/hicodet/detections/test_image_gt.png")
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--lr', default=1e-5, type=float)
-    parser.add_argument('--lr_backbone', default=1e-6, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--lr', default=0.5e-4, type=float)
+    parser.add_argument('--lr_backbone', default=0.5e-5, type=float)
+    parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--lr_drop', default=200, type=int)
@@ -374,7 +425,7 @@ if __name__ == '__main__':
     parser.add_argument('--pretrained', default='', help='Start from a pre-trained model')
     parser.add_argument('--resume', default='', help='Resume from a model')
     parser.add_argument('--output_dir', default='checkpoints')
-    parser.add_argument('--print-interval', default=1000, type=int)
+    parser.add_argument('--print-interval', default=100, type=int)
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--eval', action='store_true')
