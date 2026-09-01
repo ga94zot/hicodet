@@ -125,9 +125,18 @@ class HICODet(ImageDataset):
         with open(f"{self.llava_answer_path+self._filenames[intra_idx].replace('jpg', 'txt')}", "r") as f:
             llava_answer = f.readlines()
         try:
-            llava_answer_label = np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
+            # llava_answer_label = np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
+            # FIX (hoi_openworld, 2026-08-28): pocket.ops.relocate_to_cuda (called from the
+            # DataLoader/collate path used by real training, not exercised by a bare
+            # dataset[i] sanity check) only knows Tensor/list/dict and raises
+            # `TypeError: Unsupported type of data <class 'numpy.ndarray'>` on a raw
+            # numpy array. Wrap in torch.from_numpy() so the collated batch is all tensors.
+            llava_answer_label = torch.from_numpy(
+                np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
+            )
         except:
-            llava_answer_label = np.array([57], dtype=np.int64)
+            # llava_answer_label = np.array([57], dtype=np.int64)
+            llava_answer_label = torch.from_numpy(np.array([57], dtype=np.int64))
         llava_vision_feature = torch.load(f"{self.llava_token_path+self._filenames[intra_idx].replace('jpg', 'pt')}", "cpu").to(torch.float32)
 
         return self._transforms(
