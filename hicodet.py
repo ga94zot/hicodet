@@ -138,6 +138,23 @@ class HICODet(ImageDataset):
             # llava_answer_label = np.array([57], dtype=np.int64)
             llava_answer_label = torch.from_numpy(np.array([57], dtype=np.int64))
         llava_vision_feature = torch.load(f"{self.llava_token_path+self._filenames[intra_idx].replace('jpg', 'pt')}", "cpu").to(torch.float32)
+        # 2026-09-03 (hoi_openworld, DINO-fusion experiment): if DINO_TOKEN_PATH is
+        # set, load the DINOv3 dump for the same image and concatenate along the
+        # feature dim. Both dumps are (577, D) with the SAME 24x24 patch grid at
+        # 384x384 square resize (576 patches + 1 global token last), so the cat is
+        # token-aligned: rows [:-1] are spatially corresponding patches. The model
+        # side (pvic.py, gated by DINO_FUSE) splits [..., :1536] back out for the
+        # decoder's VLM tokens and routes [..., 1536:] into FeatureHead. Default
+        # (env unset) leaves this method byte-identical to before.
+        _dino_root = os.environ.get("DINO_TOKEN_PATH")
+        if _dino_root:
+            # Reuse the train/test decision this class already made for
+            # llava_token_path at __init__ (lines 84-87) instead of re-deriving it.
+            _split = "train" if self.llava_token_path.rstrip("/").endswith("train") else "test"
+            _dino_path = os.path.join(_dino_root, _split,
+                                      self._filenames[intra_idx].replace("jpg", "pt"))
+            _dino = torch.load(_dino_path, "cpu").to(torch.float32)
+            llava_vision_feature = torch.cat([llava_vision_feature, _dino], dim=-1)
 
         return self._transforms(
             self.load_image(os.path.join(self._root, self._filenames[intra_idx])), 
