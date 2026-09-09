@@ -58,7 +58,10 @@ class Engine(pocket.core.DistributedLearningEngine):
             self.save_checkpoint()
         if self._state.lr_scheduler is not None:
             self._state.lr_scheduler.step()
-        with open("/home/MasterThesis/pvic/hicodet/detections/log.txt" ,'a') as f:
+        # Release cleanup 2026-09-09: the log used to go to a hard-coded path on the development
+        # machine; write it next to the checkpoints (--output_dir, kept by the engine as _cache_dir).
+        # with open("/home/MasterThesis/pvic/hicodet/detections/log.txt" ,'a') as f:
+        with open(os.path.join(self._cache_dir, "log.txt"), 'a') as f:
             f.write(f"epoch={self._state.epoch}, mAP={mAP}, max_recall={max_recall}\n")
     @torch.no_grad()
     def eval(self, postprocessors, thresh=0.1):
@@ -348,7 +351,10 @@ def sanity_check(args):
     image_copy = image.copy()
     pocket.utils.draw_boxes(image, boxes[keep], width=3)
     image.show(title='Detected boxes')
-    image.save("/home/MasterThesis/pvic/hicodet/detections/test_image_det.png")
+    # Release cleanup 2026-09-09: debug images go to --output_dir instead of a hard-coded path.
+    # image.save("/home/MasterThesis/pvic/hicodet/detections/test_image_det.png")
+    os.makedirs(args.output_dir, exist_ok=True)
+    image.save(os.path.join(args.output_dir, "test_image_det.png"))
     _, _, boxes = postprocessors(
         dict(
             pred_logits=torch.rand(1, 3, 81),
@@ -357,7 +363,8 @@ def sanity_check(args):
     )[0].values()
     pocket.utils.draw_boxes(image_copy, boxes, width=3)
     image_copy.show(title='Ground truth boxes')
-    image_copy.save("/home/MasterThesis/pvic/hicodet/detections/test_image_gt.png")
+    # image_copy.save("/home/MasterThesis/pvic/hicodet/detections/test_image_gt.png")
+    image_copy.save(os.path.join(args.output_dir, "test_image_gt.png"))
 
 if __name__ == '__main__':
 
