@@ -72,9 +72,15 @@ class HICODet(ImageDataset):
         with open(anno_file, 'r') as f:
             anno = json.load(f)
 
-        self.num_object_cls = 80
-        self.num_interation_cls = 600
-        self.num_action_cls = 117
+        # self.num_object_cls = 80          # original (HICO-DET constants)
+        # self.num_interation_cls = 600
+        # self.num_action_cls = 117
+        # 2026-09-14 (ov_hoi OV_SWIG_DESIGN.md §2.2): read the vocabulary sizes from the annotation
+        # file so the same class serves SWIG-HOI converted to this format (1000 / 14130 / 407).
+        # For HICO-DET the json yields exactly 80 / 600 / 117 -> behaviour unchanged.
+        self.num_object_cls = len(anno['objects'])
+        self.num_interation_cls = len(anno['correspondence'])
+        self.num_action_cls = len(anno['verbs'])
         self._anno_file = anno_file
         
         # Load annotations
@@ -122,21 +128,34 @@ class HICODet(ImageDataset):
                     "object": list[N]
         """
         intra_idx = self.train_idx[i]
-        with open(f"{self.llava_answer_path+self._filenames[intra_idx].replace('jpg', 'txt')}", "r") as f:
-            llava_answer = f.readlines()
+        # 2026-09-14 (OV_SWIG_DESIGN.md §2.5): LLAVA_ANSWER_OFF=1 disables the VLM text channel
+        # explicitly -- no answer file is read and an EMPTY id tensor is returned (the decoder then
+        # gets zero answer tokens). Without this gate a missing .txt silently falls back to id 57,
+        # which is 'no_interaction' on HICO but an arbitrary verb on SWIG. Default: unchanged.
+        if os.environ.get("LLAVA_ANSWER_OFF") == "1":
+            llava_answer = ["", ""]
+            llava_answer_label = torch.zeros(0, dtype=torch.int64)
+        else:
+            with open(f"{self.llava_answer_path+self._filenames[intra_idx].replace('jpg', 'txt')}", "r") as f:
+                llava_answer = f.readlines()
         try:
-            # llava_answer_label = np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
-            # FIX (hoi_openworld, 2026-08-28): pocket.ops.relocate_to_cuda (called from the
-            # DataLoader/collate path used by real training, not exercised by a bare
-            # dataset[i] sanity check) only knows Tensor/list/dict and raises
-            # `TypeError: Unsupported type of data <class 'numpy.ndarray'>` on a raw
-            # numpy array. Wrap in torch.from_numpy() so the collated batch is all tensors.
-            llava_answer_label = torch.from_numpy(
-                np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
-            )
+          if os.environ.get("LLAVA_ANSWER_OFF") == "1":
+            pass
+          else:
+              # llava_answer_label = np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
+              # FIX (hoi_openworld, 2026-08-28): pocket.ops.relocate_to_cuda (called from the
+              # DataLoader/collate path used by real training, not exercised by a bare
+              # dataset[i] sanity check) only knows Tensor/list/dict and raises
+              # `TypeError: Unsupported type of data <class 'numpy.ndarray'>` on a raw
+              # numpy array. Wrap in torch.from_numpy() so the collated batch is all tensors.
+              llava_answer_label = torch.from_numpy(
+                  np.array(llava_answer[1].strip().split(" "), dtype=np.int64)
+              )
         except:
             # llava_answer_label = np.array([57], dtype=np.int64)
             llava_answer_label = torch.from_numpy(np.array([57], dtype=np.int64))
+            if os.environ.get("LLAVA_ANSWER_OFF") == "1":   # 2026-09-14: never fall back to 57 when the channel is off
+                llava_answer_label = torch.zeros(0, dtype=torch.int64)
         llava_vision_feature = torch.load(f"{self.llava_token_path+self._filenames[intra_idx].replace('jpg', 'pt')}", "cpu").to(torch.float32)
         # 2026-09-03 (hoi_openworld, DINO-fusion experiment): if DINO_TOKEN_PATH is
         # set, load the DINOv3 dump for the same image and concatenate along the
@@ -384,6 +403,30 @@ class HICODet(ImageDataset):
         """Return the size (width, height) of an image"""
         return self._image_sizes[self._idx[idx]]
 
+
+    @staticmethod
+    def _drop_unseen(anno_i, unseen, mode):
+        """2026-09-14 (ov_hoi, Codex audit 2026-09-11 verified): remove annotation rows whose HOI is in
+        `unseen` WITHOUT the pop-inside-enumerate bug of the original code (which skipped the row after
+        every removed one and left e.g. 32,074 NF-UC / 6,799 UV unseen rows in training).
+          mode 'row'  : drop exactly the unseen rows (default, strict per-annotation isolation)
+          mode 'pair' : additionally drop every other label of a human/object box pair that carries an
+                        unseen label (DA-HOI's rule: the whole pair is excluded)
+        Returns True when the image keeps at least one annotation."""
+        n = len(anno_i['hoi'])
+        keep = [j for j in range(n) if anno_i['hoi'][j] not in unseen]
+        # 2026-09-17: DROP_NO_INTERACTION=1 additionally removes no_interaction (verb 57) rows from TRAINING,
+        # as DA-HOI / GEN-VLKT / INP-CC do ("if hoi['category_id'] - 1 == 57: continue"). Default off.
+        if os.environ.get("DROP_NO_INTERACTION") == "1":
+            keep = [j for j in keep if anno_i['verb'][j] != 57]
+        if mode == 'pair':
+            bad = {(tuple(anno_i['boxes_h'][j]), tuple(anno_i['boxes_o'][j])) for j in range(n) if anno_i['hoi'][j] in unseen}
+            keep = [j for j in keep if (tuple(anno_i['boxes_h'][j]), tuple(anno_i['boxes_o'][j])) not in bad]
+        for k in list(anno_i.keys()):
+            if isinstance(anno_i[k], list) and len(anno_i[k]) == n:
+                anno_i[k] = [anno_i[k][j] for j in keep]
+        return len(anno_i['hoi']) > 0
+
     def _load_annotation_and_metadata(self, f: dict, train_type) -> None:
         """
         Arguments:
@@ -474,43 +517,107 @@ class HICODet(ImageDataset):
         if train_type == "RF_UC":
             self._rf_uc_idx = self._idx.copy()
             if "train" in self._root:
-                for i in idx:
-                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
-                        if hoi in self._rf_uc:
-                            for k in self._anno[i].keys():
-                                self._anno[i][k].pop(pair_idx)
-                        if len(self._anno[i]['hoi']) == 0:
+                # --- original (buggy: pop inside enumerate skips the next row) ---
+                # for i in idx:
+                #     for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                #         if hoi in self._rf_uc:
+                #             for k in self._anno[i].keys():
+                #                 self._anno[i][k].pop(pair_idx)
+                #         if len(self._anno[i]['hoi']) == 0:
+                #             self._rf_uc_idx.remove(i)
+                # --- 2026-09-14: ZS_FILTER=legacy reproduces the original; default 'row' (or 'pair') is strict ---
+                _mode = os.environ.get('ZS_FILTER', 'row')
+                if _mode == 'legacy':
+                    for i in idx:
+                        for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                            if hoi in self._rf_uc:
+                                for k in self._anno[i].keys():
+                                    self._anno[i][k].pop(pair_idx)
+                            if len(self._anno[i]['hoi']) == 0:
+                                self._rf_uc_idx.remove(i)
+                else:
+                    _uns = set(self._rf_uc)
+                    for i in idx:
+                        if not self._drop_unseen(self._anno[i], _uns, _mode):
                             self._rf_uc_idx.remove(i)
         
         if train_type == "NF_UC":
             self._nf_uc_idx = self._idx.copy()
             if "train" in self._root:
-                for i in idx:
-                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
-                        if hoi in self._nf_uc:
-                            for k in self._anno[i].keys():
-                                self._anno[i][k].pop(pair_idx)
-                        if len(self._anno[i]['hoi']) == 0:
+                # --- original (buggy: pop inside enumerate skips the next row) ---
+                # for i in idx:
+                #     for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                #         if hoi in self._nf_uc:
+                #             for k in self._anno[i].keys():
+                #                 self._anno[i][k].pop(pair_idx)
+                #         if len(self._anno[i]['hoi']) == 0:
+                #             self._nf_uc_idx.remove(i)
+                # --- 2026-09-14: ZS_FILTER=legacy reproduces the original; default 'row' (or 'pair') is strict ---
+                _mode = os.environ.get('ZS_FILTER', 'row')
+                if _mode == 'legacy':
+                    for i in idx:
+                        for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                            if hoi in self._nf_uc:
+                                for k in self._anno[i].keys():
+                                    self._anno[i][k].pop(pair_idx)
+                            if len(self._anno[i]['hoi']) == 0:
+                                self._nf_uc_idx.remove(i)
+                else:
+                    _uns = set(self._nf_uc)
+                    for i in idx:
+                        if not self._drop_unseen(self._anno[i], _uns, _mode):
                             self._nf_uc_idx.remove(i)
         
         if train_type == "UV":
             self._uv_idx = self._idx.copy()
             if "train" in self._root:
-                for i in idx:
-                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
-                        if hoi in self._uv:
-                            for k in self._anno[i].keys():
-                                self._anno[i][k].pop(pair_idx)
-                        if len(self._anno[i]['hoi']) == 0:
+                # --- original (buggy: pop inside enumerate skips the next row) ---
+                # for i in idx:
+                #     for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                #         if hoi in self._uv:
+                #             for k in self._anno[i].keys():
+                #                 self._anno[i][k].pop(pair_idx)
+                #         if len(self._anno[i]['hoi']) == 0:
+                #             self._uv_idx.remove(i)
+                # --- 2026-09-14: ZS_FILTER=legacy reproduces the original; default 'row' (or 'pair') is strict ---
+                _mode = os.environ.get('ZS_FILTER', 'row')
+                if _mode == 'legacy':
+                    for i in idx:
+                        for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                            if hoi in self._uv:
+                                for k in self._anno[i].keys():
+                                    self._anno[i][k].pop(pair_idx)
+                            if len(self._anno[i]['hoi']) == 0:
+                                self._uv_idx.remove(i)
+                else:
+                    _uns = set(self._uv)
+                    for i in idx:
+                        if not self._drop_unseen(self._anno[i], _uns, _mode):
                             self._uv_idx.remove(i)
         
         if train_type == "UO":
             self._uo_idx = self._idx.copy()
             if "train" in self._root:
-                for i in idx:
-                    for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
-                        if hoi in self._uo:
-                            for k in self._anno[i].keys():
-                                self._anno[i][k].pop(pair_idx)
-                        if len(self._anno[i]['hoi']) == 0:
+                # --- original (buggy: pop inside enumerate skips the next row) ---
+                # for i in idx:
+                #     for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                #         if hoi in self._uo:
+                #             for k in self._anno[i].keys():
+                #                 self._anno[i][k].pop(pair_idx)
+                #         if len(self._anno[i]['hoi']) == 0:
+                #             self._uo_idx.remove(i)
+                # --- 2026-09-14: ZS_FILTER=legacy reproduces the original; default 'row' (or 'pair') is strict ---
+                _mode = os.environ.get('ZS_FILTER', 'row')
+                if _mode == 'legacy':
+                    for i in idx:
+                        for pair_idx, hoi in enumerate(self._anno[i]['hoi']):
+                            if hoi in self._uo:
+                                for k in self._anno[i].keys():
+                                    self._anno[i][k].pop(pair_idx)
+                            if len(self._anno[i]['hoi']) == 0:
+                                self._uo_idx.remove(i)
+                else:
+                    _uns = set(self._uo)
+                    for i in idx:
+                        if not self._drop_unseen(self._anno[i], _uns, _mode):
                             self._uo_idx.remove(i)
